@@ -96,3 +96,155 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import gzip
+import json
+import os
+import pickle
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.model_selection import GridSearchCV
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+
+
+class CreditDefaultLearner:
+    def __init__(self):
+        self.model_pipeline = None
+        self.categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+        self.numerical_features = [
+            "LIMIT_BAL", "AGE", "PAY_0", "PAY_2", "PAY_3", "PAY_4",
+            "PAY_5", "PAY_6", "BILL_AMT1", "BILL_AMT2", "BILL_AMT3",
+            "BILL_AMT4", "BILL_AMT5", "BILL_AMT6", "PAY_AMT1", 
+            "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6"
+        ]
+
+    def _preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Transformación y limpieza de datos fluida."""
+        return (
+            df.drop(columns=["ID"])
+            .rename(columns={"default payment next month": "default"})
+            .dropna()
+            .query("EDUCATION != 0 and MARRIAGE != 0")
+            .assign(EDUCATION=lambda x: x["EDUCATION"].clip(upper=4))
+        )
+
+    def load_data(self, train_path, test_path):
+        raw_train = pd.read_csv(train_path, compression="zip")
+        raw_test = pd.read_csv(test_path, compression="zip")
+
+        self.train_df = self._preprocess(raw_train)
+        self.test_df = self._preprocess(raw_test)
+
+    def build_pipeline(self):
+        # Preprocesamiento de columnas
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ("cat", OneHotEncoder(handle_unknown="ignore"), self.categorical_features),
+                ("num", StandardScaler(), self.numerical_features),
+            ]
+        )
+
+        # Definición del Pipeline secuencial
+        return Pipeline([
+            ("preprocessor", preprocessor),
+            ("feature_selection", SelectKBest(score_func=f_classif)),
+            ("pca", PCA()),
+            ("classifier", MLPClassifier(max_iter=15000, random_state=17)),
+        ])
+
+    def train(self):
+        X_train = self.train_df.drop(columns="default")
+        y_train = self.train_df["default"]
+
+        base_pipeline = self.build_pipeline()
+
+        # Configuración exacta de hiperparámetros
+        params = {
+            "pca__n_components": [None],
+            "feature_selection__k": [20],
+            "classifier__hidden_layer_sizes": [(50, 30, 40, 60)],
+            "classifier__alpha": [0.26],
+            "classifier__learning_rate_init": [0.001],
+        }
+
+        self.model_pipeline = GridSearchCV(
+            base_pipeline,
+            param_grid=params,
+            cv=10,
+            scoring="balanced_accuracy",
+            n_jobs=-1,
+            verbose=2
+        )
+
+        self.model_pipeline.fit(X_train, y_train)
+
+    def save_artifacts(self, model_path, metrics_path):
+        # 1. Guardar Modelo
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        with gzip.open(model_path, "wb") as f:
+            pickle.dump(self.model_pipeline, f)
+
+        # 2. Calcular Métricas
+        metrics_data = []
+        datasets = {
+            "train": (self.train_df.drop(columns="default"), self.train_df["default"]),
+            "test": (self.test_df.drop(columns="default"), self.test_df["default"])
+        }
+
+        # Generar métricas (Train primero, luego Test)
+        for name, (X, y) in datasets.items():
+            y_pred = self.model_pipeline.predict(X)
+            metrics_data.append({
+                "type": "metrics",
+                "dataset": name,
+                "precision": round(precision_score(y, y_pred), 4),
+                "balanced_accuracy": round(balanced_accuracy_score(y, y_pred), 4),
+                "recall": round(recall_score(y, y_pred), 4),
+                "f1_score": round(f1_score(y, y_pred), 4),
+            })
+
+        # Generar matrices de confusión (Train primero, luego Test)
+        for name, (X, y) in datasets.items():
+            y_pred = self.model_pipeline.predict(X)
+            cm = confusion_matrix(y, y_pred)
+            metrics_data.append({
+                "type": "cm_matrix",
+                "dataset": name,
+                "true_0": {"predicted_0": int(cm[0, 0]), "predicted_1": int(cm[0, 1])},
+                "true_1": {"predicted_0": int(cm[1, 0]), "predicted_1": int(cm[1, 1])},
+            })
+
+        # 3. Guardar JSONL
+        os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
+        with open(metrics_path, "w") as f:
+            for record in metrics_data:
+                f.write(json.dumps(record) + "\n")
+
+
+if __name__ == "__main__":
+    learner = CreditDefaultLearner()
+    learner.load_data(
+        "files/input/train_data.csv.zip", 
+        "files/input/test_data.csv.zip"
+    )
+    
+    print("Entrenando red neuronal...")
+    learner.train()
+    
+    print("Guardando resultados...")
+    learner.save_artifacts(
+        "files/models/model.pkl.gz", 
+        "files/output/metrics.json"
+    )
